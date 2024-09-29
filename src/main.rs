@@ -9,29 +9,49 @@ use std::cmp::{Eq, PartialEq};
 
 use rand::Rng;
 use rand::seq::SliceRandom;
+use rand_distr::LogNormal;
 use rand_xoshiro::Xoshiro256StarStar;
 
-struct CPUTask {
+struct SharedRateTenant {
     due_timer_time: u64,
     handler: Box<dyn FnOnce(u64) -> Vec<ProposedEvent>>,
 }
 
-struct SharedCPUResource {
+struct SharedRateResource {
     id: u64,
-    cpu_timer: u64,
-    cpu_timer_last_updated_real_time: u64,
+    partitions: u8,
+    resource_timer: u64,
+    resource_timer_last_updated_real_time: u64,
     shutting_down: Rc<RefCell<bool>>,
-    tasks: BinaryHeap<CPUTask>,
+    tenants: BinaryHeap<SharedRateTenant>,
+    rng: Xoshiro256StarStar,
     //  metrics: ...,
 }
 
-struct DueTimeDelta {
-    mu: u64,
-    sigma: f32,
+impl SharedRateResource {
+    fn update_resource_timer(&mut self, current_timestamp: u64) {
+        assert!(self.resource_timer_last_updated_real_time <= current_timestamp);
+
+        if self.tenants.is_empty() {
+            self.resource_timer = 0;
+        } else if self.resource_timer_last_updated_real_time != current_timestamp {
+            let increment = (
+                current_timestamp - self.resource_timer_last_updated_real_time
+            ) as f64 * f64::min(1.0, self.partitions as f64 / self.tenants.len() as f64);
+
+            self.resource_timer += increment as u64;
+
+            // should be hard for us to go past our target because float-int
+            // conversion rounds towards zero
+            assert!(self.resource_timer < self.tenants.peek().unwrap().due_timer_time);
+        }
+
+        self.resource_timer_last_updated_real_time = current_timestamp;
+    }
 }
 
 struct ProposedEvent {
-    due_time: DueTimeDelta,
+    due_time: LogNormal<f32>,
     handler: Box<dyn FnOnce(u64) -> Vec<ProposedEvent>>,
 }
 
@@ -79,7 +99,7 @@ struct Worker {
     id: u64,
     subscribed_queues: Vec<Rc<RefCell<Queue>>>,
     shutting_down: Rc<RefCell<bool>>,
-    shared_cpu_resource: Rc<RefCell<SharedCPUResource>>,
+    shared_cpu_resource: Rc<RefCell<SharedRateResource>>,
     rng: Xoshiro256StarStar,
     //  metrics: ...,
 }
@@ -216,14 +236,14 @@ struct AutoscalerWorker {
     shutting_down: Rc<RefCell<bool>>,
 }
 
-struct AutoscalerSharedCPUResource {
+struct AutoscalerSharedRateResource {
     shutting_down: Rc<RefCell<bool>>,
     workers: HashMap<u64, AutoscalerWorker>,
 }
 
 struct Autoscaler {
     name: String,
-    shared_cpu_resources: HashMap<u64, AutoscalerSharedCPUResource>,
+    shared_rate_resources: HashMap<u64, AutoscalerSharedRateResource>,
     //  metrics: ...
 }
 
@@ -341,17 +361,23 @@ impl WorkerToken {
     }
 }
 
-// fn mk_shared_cpu_event<A, R>(
-//     shared_cpu_resource: Rc<RefCell<SharedCPUResource>>,
-//     owed_cpu_time: u64,
+// fn mk_shared_rate_event<A, R>(
+//     current_timestamp: u64,
+//     shared_rate_resource: Rc<RefCell<SharedRateResource>>,
+//     required_resource_time: LogNormal<f32>,
 //     inner_handler: impl FnOnce(A) -> R,
 // ) -> R
 // where
 //     A: HasTimestamp,
 //     R: HasProposedEvents,
 // {
-//     // ...
-//     // destructor guard to ensure resulting event isn't dropped? (linear type systems can do this statically?)
+//     shared_rate_resource.borrow_mut().update_resource_timer();
+//     let actual_req_resource_time = required_resource_time.sample(
+//         &mut shared_rate_resource.borrow_mut().rng
+//     );
+//     
+// 
+//     // TODO destructor guard to ensure resulting event isn't dropped? (linear type systems can do this statically?)
 // }
 
 // worker_token.worker.metrics. ...
