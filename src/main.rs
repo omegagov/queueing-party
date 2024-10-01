@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::hash::{Hash, Hasher};
-use std::cmp::{Eq, PartialEq};
+use std::cmp::{Eq, PartialEq, Ordering, max};
 
 use rand::Rng;
 use rand::seq::SliceRandom;
-use rand_distr::LogNormal;
+use rand_distr::{Distribution, LogNormal};
 use rand_xoshiro::Xoshiro256StarStar;
 
 struct SharedRateTenant {
@@ -17,11 +17,32 @@ struct SharedRateTenant {
     handler: Box<dyn FnOnce(u64) -> Vec<ProposedEvent>>,
 }
 
+impl Ord for SharedRateTenant {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.due_timer_time.cmp(&other.due_timer_time).reverse()
+    }
+}
+
+impl PartialOrd for SharedRateTenant {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for SharedRateTenant {
+    fn eq(&self, other: &Self) -> bool {
+        self.due_timer_time == other.due_timer_time
+    }
+}
+
+impl Eq for SharedRateTenant {}
+
 struct SharedRateResource {
     id: u64,
     partitions: u8,
     resource_timer: u64,
     resource_timer_last_updated_real_time: u64,
+    event_real_time_cache: VecDeque<u64>,
     shutting_down: Rc<RefCell<bool>>,
     tenants: BinaryHeap<SharedRateTenant>,
     rng: Xoshiro256StarStar,
@@ -37,7 +58,7 @@ impl SharedRateResource {
         } else if self.resource_timer_last_updated_real_time != current_timestamp {
             let increment = (
                 current_timestamp - self.resource_timer_last_updated_real_time
-            ) as f64 * f64::min(1.0, self.partitions as f64 / self.tenants.len() as f64);
+            ) as f64 * self.get_current_resource_timer_rate().unwrap();
 
             self.resource_timer += increment as u64;
 
@@ -47,6 +68,25 @@ impl SharedRateResource {
         }
 
         self.resource_timer_last_updated_real_time = current_timestamp;
+    }
+
+    fn get_current_resource_timer_rate(&self) -> Option<f64> {
+        if self.tenants.is_empty() {
+            None
+        } else {
+            Some(f64::min(1.0, self.partitions as f64 / self.tenants.len() as f64))
+        }
+    }
+
+    fn get_next_tenant_expected_real_time(&self) -> Option<u64> {
+        if self.tenants.is_empty() {
+            None
+        } else {
+            Some((
+                (self.tenants.peek().unwrap().due_timer_time - self.resource_timer) as f64
+                / self.get_current_resource_timer_rate().unwrap()
+            ) as u64 + self.resource_timer_last_updated_real_time)
+        }
     }
 }
 
@@ -361,24 +401,34 @@ impl WorkerToken {
     }
 }
 
-// fn mk_shared_rate_event<A, R>(
-//     current_timestamp: u64,
-//     shared_rate_resource: Rc<RefCell<SharedRateResource>>,
-//     required_resource_time: LogNormal<f32>,
-//     inner_handler: impl FnOnce(A) -> R,
-// ) -> R
-// where
-//     A: HasTimestamp,
-//     R: HasProposedEvents,
-// {
-//     shared_rate_resource.borrow_mut().update_resource_timer();
-//     let actual_req_resource_time = required_resource_time.sample(
-//         &mut shared_rate_resource.borrow_mut().rng
-//     );
-//     
-// 
-//     // TODO destructor guard to ensure resulting event isn't dropped? (linear type systems can do this statically?)
-// }
+fn mk_shared_rate_event<A, Ri, Ro>(
+    current_timestamp: u64,
+    shared_rate_resource: Rc<RefCell<SharedRateResource>>,
+    required_resource_time: LogNormal<f32>,
+    inner_handler: impl FnOnce(A) -> Ri + 'static,
+) -> Ro
+where
+    A: HasTimestamp,
+    Ri: HasProposedEvents + IntoLossy<Vec<ProposedEvent>>,
+    Ro: HasProposedEvents + Default,
+    u64: IntoLossy<A>,
+{
+    shared_rate_resource.borrow_mut().update_resource_timer(current_timestamp);
+    let actual_req_resource_time = max(
+        1,
+        required_resource_time.sample(&mut shared_rate_resource.borrow_mut().rng) as u64,
+    );
+    shared_rate_resource.borrow_mut().tenants.push(SharedRateTenant {
+        due_timer_time: shared_rate_resource.borrow().resource_timer + actual_req_resource_time,
+        handler: Box::new(move |timestamp: u64| -> Vec<ProposedEvent> {
+            inner_handler(timestamp.into_lossy()).into_lossy()
+        }),
+    });
+
+    Default::default()
+
+    // TODO destructor guard to ensure resulting event isn't dropped? (linear type systems can do this statically?)
+}
 
 // worker_token.worker.metrics. ...
 
