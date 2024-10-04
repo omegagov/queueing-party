@@ -91,25 +91,53 @@ impl SharedRateResource {
         }
     }
 
-    fn maybe_generate_wakeup_event(&mut self) -> Option<Vec<ProposedEvent>> {
-        if self.tenancies.is_empty() {
-            None
-        } else {
-            let t = self.get_next_wakeup_time().unwrap();
-            if !self.wakeup_event_memo.contains(&t) {
-                self.wakeup_event_memo.truncate(Self::max_wakeup_event_memo_len as usize - 1);
-                self.wakeup_event_memo.push_front(t);
+    fn maybe_generate_wakeup_event(self_rc_refcell: Rc<RefCell<Self>>) -> Option<Vec<ProposedEvent>> {
+        let srr = self_rc_refcell;
 
-//             return Vec::from([ProposedEvent {
-//                 due_time: LogNormal::from_mean_cv(rt as f64, f64::zero()),
-//                 handler: |timestamp| {
-//                     
-//                 },
-//             }]);
-            }
-
-            Some(Default::default())
+        if srr.borrow().tenancies.is_empty() {
+            return None;
         }
+
+        let t = srr.borrow().get_next_wakeup_time().unwrap();
+        if !srr.borrow().wakeup_event_memo.contains(&t) {
+            srr.borrow_mut().wakeup_event_memo.truncate(Self::max_wakeup_event_memo_len as usize - 1);
+            srr.borrow_mut().wakeup_event_memo.push_front(t);
+
+            let srrc = srr.clone();
+            return Some(Vec::from([ProposedEvent {
+                due_time: LogNormal::from_mean_cv(t as f32, 0.0).unwrap(),
+                handler: Box::new(move |timestamp| {
+                    let mut handlers = Vec::new();
+                    while let Some(wt) = srrc.borrow().get_next_wakeup_time() {
+                        if wt != timestamp {
+                            break;
+                        }
+                        handlers.push(srrc.borrow_mut().tenancies.pop().unwrap());
+                    }
+
+                    if !handlers.is_empty() {
+                        // if we can avoid doing this we should because it potentially
+                        // adds precision error every time it runs
+                        srrc.borrow_mut().update_resource_timer(timestamp);
+                    }
+
+                    SliceRandom::shuffle(
+                        &mut handlers[..],
+                        &mut srrc.borrow_mut().rng,
+                    );
+                    let mut ret: Vec<ProposedEvent> = handlers.drain(..).flat_map(|tenancy| {
+                        (tenancy.handler)(timestamp)
+                    }).collect();
+
+                    if let Some(mut mwvec) = Self::maybe_generate_wakeup_event(srrc) {
+                        ret.append(&mut mwvec);
+                    }
+                    return ret;
+                }),
+            }]));
+        }
+
+        Some(Default::default())
     }
 }
 
@@ -443,13 +471,16 @@ where
     );
     shared_rate_resource.borrow_mut().tenancies.push(SharedRateTenancy {
         due_timer_time: shared_rate_resource.borrow().resource_timer + actual_req_resource_time,
-        handler: Box::new(move |timestamp: u64| -> Vec<ProposedEvent> {
+        handler: Box::new(move |timestamp| {
             inner_handler(timestamp.into_lossy()).into_lossy()
         }),
     });
 
-
-    Default::default()
+    let mut ret: Ro = Default::default();
+    ret.set_proposed_events(
+        SharedRateResource::maybe_generate_wakeup_event(shared_rate_resource).unwrap()
+    );
+    ret
 
     // TODO destructor guard to ensure resulting event isn't dropped? (linear type systems can do this statically?)
 }
