@@ -70,6 +70,8 @@ impl SharedRateResource {
         }
 
         self.resource_timer_last_updated_real_time = current_timestamp;
+
+        // TODO accumulate timer time for metrics
     }
 
     fn get_current_resource_timer_rate(&self) -> Option<f64> {
@@ -89,6 +91,30 @@ impl SharedRateResource {
                 / self.get_current_resource_timer_rate().unwrap()
             ) as u64 + self.resource_timer_last_updated_real_time)
         }
+    }
+
+    fn add_tenancy<A, Ri>(
+        &mut self,
+        current_timestamp: u64,
+        required_resource_time: LogNormal<f32>,
+        inner_handler: impl FnOnce(A) -> Ri + 'static,
+    )
+    where
+        A: HasTimestamp,
+        Ri: HasProposedEvents + IntoLossy<Vec<ProposedEvent>>,
+        u64: IntoLossy<A>,
+    {
+        self.update_resource_timer(current_timestamp);
+        let actual_req_resource_time = max(
+            1,
+            required_resource_time.sample(&mut self.rng) as u64,
+        );
+        self.tenancies.push(SharedRateTenancy {
+            due_timer_time: self.resource_timer + actual_req_resource_time,
+            handler: Box::new(move |timestamp| {
+                inner_handler(timestamp.into_lossy()).into_lossy()
+            }),
+        });
     }
 
     fn maybe_generate_wakeup_event(shared_rate_resource: Rc<RefCell<Self>>) -> Option<Vec<ProposedEvent>> {
@@ -144,6 +170,31 @@ impl SharedRateResource {
         }
 
         Some(Default::default())
+    }
+
+    fn mk_shared_rate_event<A, Ri, Ro>(
+        shared_rate_resource: Rc<RefCell<SharedRateResource>>,
+        current_timestamp: u64,
+        required_resource_time: LogNormal<f32>,
+        inner_handler: impl FnOnce(A) -> Ri + 'static,
+    ) -> Ro
+    where
+        A: HasTimestamp,
+        Ri: HasProposedEvents + IntoLossy<Vec<ProposedEvent>>,
+        Ro: HasProposedEvents + Default,
+        u64: IntoLossy<A>,
+    {
+        shared_rate_resource.borrow_mut().add_tenancy(
+            current_timestamp,
+            required_resource_time,
+            inner_handler,
+        );
+
+        let mut ret: Ro = Default::default();
+        ret.set_proposed_events(
+            SharedRateResource::maybe_generate_wakeup_event(shared_rate_resource).unwrap()
+        );
+        ret
     }
 }
 
@@ -455,37 +506,6 @@ impl WorkerToken {
             return ret.into_lossy();
         }
     }
-}
-
-fn mk_shared_rate_event<A, Ri, Ro>(
-    current_timestamp: u64,
-    shared_rate_resource: Rc<RefCell<SharedRateResource>>,
-    required_resource_time: LogNormal<f32>,
-    inner_handler: impl FnOnce(A) -> Ri + 'static,
-) -> Ro
-where
-    A: HasTimestamp,
-    Ri: HasProposedEvents + IntoLossy<Vec<ProposedEvent>>,
-    Ro: HasProposedEvents + Default,
-    u64: IntoLossy<A>,
-{
-    shared_rate_resource.borrow_mut().update_resource_timer(current_timestamp);
-    let actual_req_resource_time = max(
-        1,
-        required_resource_time.sample(&mut shared_rate_resource.borrow_mut().rng) as u64,
-    );
-    shared_rate_resource.borrow_mut().tenancies.push(SharedRateTenancy {
-        due_timer_time: shared_rate_resource.borrow().resource_timer + actual_req_resource_time,
-        handler: Box::new(move |timestamp| {
-            inner_handler(timestamp.into_lossy()).into_lossy()
-        }),
-    });
-
-    let mut ret: Ro = Default::default();
-    ret.set_proposed_events(
-        SharedRateResource::maybe_generate_wakeup_event(shared_rate_resource).unwrap()
-    );
-    ret
 }
 
 // worker_token.worker.metrics. ...
