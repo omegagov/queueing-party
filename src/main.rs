@@ -416,6 +416,10 @@ trait HasWorkerTokensToRestore {
 struct BasicArgs {
     timestamp: u64,
     worker_token: Option<WorkerToken>,
+}
+
+#[derive(Default)]
+struct BasicReturn {
     proposed_events: Vec<ProposedEvent>,
     worker_tokens_to_restore: Vec<WorkerToken>,
 }
@@ -441,7 +445,7 @@ impl HasWorkerToken for BasicArgs {
     }
 }
 
-impl HasProposedEvents for BasicArgs {
+impl HasProposedEvents for BasicReturn {
     fn get_proposed_events(&self) -> &Vec<ProposedEvent> {
         &self.proposed_events
     }
@@ -453,7 +457,7 @@ impl HasProposedEvents for BasicArgs {
     }
 }
 
-impl HasWorkerTokensToRestore for BasicArgs {
+impl HasWorkerTokensToRestore for BasicReturn {
     fn get_worker_tokens_to_restore(&self) -> &Vec<WorkerToken> {
         &self.worker_tokens_to_restore
     }
@@ -499,14 +503,15 @@ impl FromLossy<u64> for BasicArgs {
     }
 }
 
-impl FromLossy<Vec<ProposedEvent>> for BasicArgs {
-    fn from_lossy(other: Vec<ProposedEvent>) -> BasicArgs {
-        BasicArgs {
+impl FromLossy<Vec<ProposedEvent>> for BasicReturn {
+    fn from_lossy(other: Vec<ProposedEvent>) -> BasicReturn {
+        BasicReturn {
             proposed_events: other,
             ..Default::default()
         }
     }
 }
+
 
 struct AutoscalerWorker {
     shutting_down: Rc<RefCell<bool>>,
@@ -523,9 +528,6 @@ struct Autoscaler {
     //  metrics: ...
 }
 
-// worker_token.worker.metrics. ...
-
-// ... "add worker" routine?
 
 struct ScheduledEvent {
     due_time: u64,
@@ -551,6 +553,7 @@ impl PartialEq for ScheduledEvent {
 }
 
 impl Eq for ScheduledEvent {}
+
 
 fn main() {
     let mut event_heap: BinaryHeap<ScheduledEvent> = Default::default();
