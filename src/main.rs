@@ -243,6 +243,61 @@ struct Queue {
     //  metrics: ...,
 }
 
+impl Queue {
+    fn enqueued_handler_inner<Ai, R>(
+        &mut self,
+        inner_handler: impl FnOnce(Ai) -> R + 'static,
+        mut args: Ai,
+    ) -> R
+    where
+        Ai: HasTimestamp + HasWorkerToken,
+        R: HasProposedEvents + IntoLossy<Vec<ProposedEvent>> + Default,
+        BasicArgs: IntoLossy<Ai>,
+    {
+        if self.deque.is_empty() && !self.listening_workers.is_empty() {
+            let chosen_worker_rc = Clone::clone(self.listening_workers.iter().nth(
+                self.rng.gen_range(0..self.listening_workers.len())
+            ).unwrap());
+
+            self.listening_workers.remove(&chosen_worker_rc);
+
+            for other_queue in &chosen_worker_rc.subscribed_queues {
+                other_queue.borrow_mut().listening_workers.remove(&chosen_worker_rc);
+            }
+
+            args.set_worker_token(Some(WorkerToken {
+                worker: Rc::into_inner(chosen_worker_rc).unwrap(),
+                checkout_timestamp: *args.get_timestamp(),
+                originating_queue_name: self.name.clone(),
+            }));
+
+            // TODO tally metric
+
+            return inner_handler(args);
+        } else {
+            self.deque.push_back(Box::new(move |args_outer| {
+                inner_handler(args_outer.into_lossy()).into_lossy()
+            }));
+            return Default::default();
+        }
+    }
+
+    fn mk_enqueued_handler<Ao, Ai, R>(
+        queue: Rc<RefCell<Queue>>,
+        inner_handler: impl FnOnce(Ai) -> R + 'static,
+    ) -> impl FnOnce(Ao) -> R
+    where
+        Ao: HasTimestamp + IntoLossy<Ai>,
+        Ai: HasTimestamp + HasWorkerToken,
+        R: HasProposedEvents + IntoLossy<Vec<ProposedEvent>> + Default,
+        BasicArgs: IntoLossy<Ai>,
+    {
+        move |args_outer: Ao| {
+            queue.borrow_mut().enqueued_handler_inner(inner_handler, args_outer.into_lossy())
+        }
+    }
+}
+
 struct Worker {
     id: u64,
     subscribed_queues: Vec<Rc<RefCell<Queue>>>,
@@ -269,7 +324,7 @@ impl Eq for Worker {}
 struct WorkerToken {
     worker: Worker,
     checkout_timestamp: u64,
-    originating_queue: Rc<RefCell<Queue>>,
+    originating_queue_name: String,
 }
 
 trait HasWorkerToken {
@@ -395,47 +450,6 @@ struct Autoscaler {
     //  metrics: ...
 }
 
-fn mk_enqueued_handler<Ao, Ai, R>(
-    queue: Rc<RefCell<Queue>>,
-    inner_handler: impl FnOnce(Ai) -> R + 'static,
-) -> impl FnOnce(Ao) -> R
-where
-    Ao: HasTimestamp + IntoLossy<Ai>,
-    Ai: HasTimestamp + HasWorkerToken,
-    R: HasProposedEvents + IntoLossy<Vec<ProposedEvent>> + Default,
-    BasicArgs: IntoLossy<Ai>,
-{
-    move |args_outer: Ao| {
-        if queue.borrow().deque.is_empty() && !queue.borrow().listening_workers.is_empty() {
-            let chosen_worker_rc = Clone::clone(queue.borrow_mut().listening_workers.iter().nth(
-                queue.borrow_mut().rng.gen_range(0..queue.borrow().listening_workers.len())
-            ).unwrap());
-
-            queue.borrow_mut().listening_workers.remove(&chosen_worker_rc);
-
-            for other_queue in &chosen_worker_rc.subscribed_queues {
-                other_queue.borrow_mut().listening_workers.remove(&chosen_worker_rc);
-            }
-
-            let mut args_inner: Ai = args_outer.into_lossy();
-            args_inner.set_worker_token(Some(WorkerToken {
-                worker: Rc::into_inner(chosen_worker_rc).unwrap(),
-                checkout_timestamp: *args_inner.get_timestamp(),
-                originating_queue: queue,
-            }));
-
-            // TODO tally metric
-
-            return inner_handler(args_inner);
-        } else {
-            queue.borrow_mut().deque.push_back(Box::new(move |args| {
-                inner_handler(args.into_lossy()).into_lossy()
-            }));
-            return Default::default();
-        }
-    }
-}
-
 impl WorkerToken {
     fn mk_token_restoring_handler<A, Ri, Ro>(
         inner_handler: impl FnOnce(A) -> Ri,
@@ -478,12 +492,13 @@ impl WorkerToken {
                         &mut token.worker.rng,
                     ).unwrap();
                     let followon_handler = chosen_queue.borrow_mut().deque.pop_front().unwrap();
+                    let chosen_queue_name = chosen_queue.borrow().name.clone();
 
                     // prepare args
                     let followon_args = BasicArgs {
                         timestamp: timestamp,
                         worker_token: Some(WorkerToken {
-                            originating_queue: (*chosen_queue).clone(),
+                            originating_queue_name: chosen_queue_name,
                             worker: token.worker,
                             checkout_timestamp: timestamp,
                         }),
