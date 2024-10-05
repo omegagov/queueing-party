@@ -15,31 +15,49 @@ use rand_xoshiro::Xoshiro256StarStar;
 use crate::args_rets::*;
 use crate::lossy_convert::*;
 
-#[derive(Default)]
-pub struct WorkerTokenArgs {
+pub struct WorkerTokenArgs<Xw> {
     timestamp: u64,
-    worker_token: Option<WorkerToken>,
+    worker_token: Option<WorkerToken<Xw>>,
 }
 
-#[derive(Default)]
-pub struct WorkerTokenReturn {
+pub struct WorkerTokenReturn<Xw> {
     proposed_events: Vec<ProposedEvent>,
-    worker_tokens_to_restore: Vec<WorkerToken>,
+    worker_tokens_to_restore: Vec<WorkerToken<Xw>>,
 }
 
-pub trait HasWorkerToken {
-    fn get_worker_token(&self) -> &Option<WorkerToken>;
-    fn get_worker_token_mut(&mut self) -> &mut Option<WorkerToken>;
-    fn set_worker_token(&mut self, new_value: Option<WorkerToken>);
+// avoid derived Default's unnecessary Default bounds on free generic parameter
+impl<Xw> Default for WorkerTokenArgs<Xw> {
+    fn default() -> Self {
+        WorkerTokenArgs {
+            timestamp: Default::default(),
+            worker_token: Default::default(),
+        }
+    }
 }
 
-pub trait HasWorkerTokensToRestore {
-    fn get_worker_tokens_to_restore(&self) -> &Vec<WorkerToken>;
-    fn get_worker_tokens_to_restore_mut(&mut self) -> &mut Vec<WorkerToken>;
-    fn set_worker_tokens_to_restore(&mut self, new_value: Vec<WorkerToken>);
+// avoid derived Default's unnecessary Default bounds on free generic parameter
+impl<Xw> Default for WorkerTokenReturn<Xw> {
+    fn default() -> Self {
+        WorkerTokenReturn {
+            proposed_events: Default::default(),
+            worker_tokens_to_restore: Default::default(),
+        }
+    }
 }
 
-impl HasTimestamp for WorkerTokenArgs {
+pub trait HasWorkerToken<Xw> {
+    fn get_worker_token(&self) -> &Option<WorkerToken<Xw>>;
+    fn get_worker_token_mut(&mut self) -> &mut Option<WorkerToken<Xw>>;
+    fn set_worker_token(&mut self, new_value: Option<WorkerToken<Xw>>);
+}
+
+pub trait HasWorkerTokensToRestore<Xw> {
+    fn get_worker_tokens_to_restore(&self) -> &Vec<WorkerToken<Xw>>;
+    fn get_worker_tokens_to_restore_mut(&mut self) -> &mut Vec<WorkerToken<Xw>>;
+    fn set_worker_tokens_to_restore(&mut self, new_value: Vec<WorkerToken<Xw>>);
+}
+
+impl<Xw> HasTimestamp for WorkerTokenArgs<Xw> {
     fn get_timestamp(&self) -> &u64 {
         &self.timestamp
     }
@@ -48,19 +66,19 @@ impl HasTimestamp for WorkerTokenArgs {
     }
 }
 
-impl HasWorkerToken for WorkerTokenArgs {
-    fn get_worker_token(&self) -> &Option<WorkerToken> {
+impl<Xw> HasWorkerToken<Xw> for WorkerTokenArgs<Xw> {
+    fn get_worker_token(&self) -> &Option<WorkerToken<Xw>> {
         &self.worker_token
     }
-    fn get_worker_token_mut(&mut self) -> &mut Option<WorkerToken> {
+    fn get_worker_token_mut(&mut self) -> &mut Option<WorkerToken<Xw>> {
         &mut self.worker_token
     }
-    fn set_worker_token(&mut self, new_value: Option<WorkerToken>) {
+    fn set_worker_token(&mut self, new_value: Option<WorkerToken<Xw>>) {
         self.worker_token = new_value
     }
 }
 
-impl HasProposedEvents for WorkerTokenReturn {
+impl<Xw> HasProposedEvents for WorkerTokenReturn<Xw> {
     fn get_proposed_events(&self) -> &Vec<ProposedEvent> {
         &self.proposed_events
     }
@@ -72,20 +90,20 @@ impl HasProposedEvents for WorkerTokenReturn {
     }
 }
 
-impl HasWorkerTokensToRestore for WorkerTokenReturn {
-    fn get_worker_tokens_to_restore(&self) -> &Vec<WorkerToken> {
+impl<Xw> HasWorkerTokensToRestore<Xw> for WorkerTokenReturn<Xw> {
+    fn get_worker_tokens_to_restore(&self) -> &Vec<WorkerToken<Xw>> {
         &self.worker_tokens_to_restore
     }
-    fn get_worker_tokens_to_restore_mut(&mut self) -> &mut Vec<WorkerToken> {
+    fn get_worker_tokens_to_restore_mut(&mut self) -> &mut Vec<WorkerToken<Xw>> {
         &mut self.worker_tokens_to_restore
     }
-    fn set_worker_tokens_to_restore(&mut self, new_value: Vec<WorkerToken>) {
+    fn set_worker_tokens_to_restore(&mut self, new_value: Vec<WorkerToken<Xw>>) {
         self.worker_tokens_to_restore = new_value
     }
 }
 
-impl FromLossy<u64> for WorkerTokenArgs {
-    fn from_lossy(other: u64) -> WorkerTokenArgs {
+impl<Xw> FromLossy<u64> for WorkerTokenArgs<Xw> {
+    fn from_lossy(other: u64) -> WorkerTokenArgs<Xw> {
         WorkerTokenArgs {
             timestamp: other,
             ..Default::default()
@@ -93,8 +111,8 @@ impl FromLossy<u64> for WorkerTokenArgs {
     }
 }
 
-impl FromLossy<Vec<ProposedEvent>> for WorkerTokenReturn {
-    fn from_lossy(other: Vec<ProposedEvent>) -> WorkerTokenReturn {
+impl<Xw> FromLossy<Vec<ProposedEvent>> for WorkerTokenReturn<Xw> {
+    fn from_lossy(other: Vec<ProposedEvent>) -> WorkerTokenReturn<Xw> {
         WorkerTokenReturn {
             proposed_events: other,
             ..Default::default()
@@ -102,24 +120,24 @@ impl FromLossy<Vec<ProposedEvent>> for WorkerTokenReturn {
     }
 }
 
-pub struct Queue {
+pub struct Queue<Xw> {
     name: String,
-    listening_workers: HashSet<Rc<Worker>>,
-    deque: VecDeque<Box<dyn FnOnce(WorkerTokenArgs) -> Vec<ProposedEvent>>>,
+    listening_workers: HashSet<Rc<Worker<Xw>>>,
+    deque: VecDeque<Box<dyn FnOnce(WorkerTokenArgs<Xw>) -> Vec<ProposedEvent>>>,
     rng: Xoshiro256StarStar,
     //  metrics: ...,
 }
 
-impl Queue {
+impl<Xw> Queue<Xw> {
     fn enqueued_handler_inner<Ai, R>(
         &mut self,
         inner_handler: impl FnOnce(Ai) -> R + 'static,
         mut args: Ai,
     ) -> R
     where
-        Ai: HasTimestamp + HasWorkerToken,
+        Ai: HasTimestamp + HasWorkerToken<Xw>,
         R: HasProposedEvents + IntoLossy<Vec<ProposedEvent>> + Default,
-        WorkerTokenArgs: IntoLossy<Ai>,
+        WorkerTokenArgs<Xw>: IntoLossy<Ai>,
     {
         if self.deque.is_empty() && !self.listening_workers.is_empty() {
             let chosen_worker_rc = Clone::clone(
@@ -156,14 +174,14 @@ impl Queue {
     }
 
     pub fn mk_enqueued_handler<Ao, Ai, R>(
-        queue: Rc<RefCell<Queue>>,
+        queue: Rc<RefCell<Queue<Xw>>>,
         inner_handler: impl FnOnce(Ai) -> R + 'static,
     ) -> impl FnOnce(Ao) -> R
     where
         Ao: HasTimestamp + IntoLossy<Ai>,
-        Ai: HasTimestamp + HasWorkerToken,
+        Ai: HasTimestamp + HasWorkerToken<Xw>,
         R: HasProposedEvents + IntoLossy<Vec<ProposedEvent>> + Default,
-        WorkerTokenArgs: IntoLossy<Ai>,
+        WorkerTokenArgs<Xw>: IntoLossy<Ai>,
     {
         move |args_outer: Ao| {
             queue
@@ -173,43 +191,43 @@ impl Queue {
     }
 }
 
-pub struct Worker {
+pub struct Worker<Xw> {
     id: u64,
-    subscribed_queues: Vec<Rc<RefCell<Queue>>>,
+    subscribed_queues: Vec<Rc<RefCell<Queue<Xw>>>>,
     shutting_down: Rc<RefCell<bool>>,
     // shared_cpu_resource: Rc<RefCell<SharedRateResource>>,
     rng: Xoshiro256StarStar,
-    // E: ext,
+    ext: Xw,
     //  metrics: ...,
 }
 
-impl Hash for Worker {
+impl<Xw> Hash for Worker<Xw> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
 }
 
-impl PartialEq for Worker {
+impl<Xw> PartialEq for Worker<Xw> {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
-impl Eq for Worker {}
+impl<Xw> Eq for Worker<Xw> {}
 
-pub struct WorkerToken {
-    worker: Worker,
+pub struct WorkerToken<Xw> {
+    worker: Worker<Xw>,
     checkout_timestamp: u64,
     originating_queue_name: String,
 }
 
-impl WorkerToken {
+impl<Xw> WorkerToken<Xw> {
     pub fn mk_token_restoring_handler<A, Ri, Ro>(
         inner_handler: impl FnOnce(A) -> Ri,
     ) -> impl FnOnce(A) -> Ro
     where
         A: HasTimestamp,
-        Ri: HasProposedEvents + HasWorkerTokensToRestore + IntoLossy<Ro>,
+        Ri: HasProposedEvents + HasWorkerTokensToRestore<Xw> + IntoLossy<Ro>,
         Ro: HasProposedEvents,
     {
         |args: A| {
