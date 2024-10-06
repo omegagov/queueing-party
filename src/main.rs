@@ -13,31 +13,19 @@ use rand_distr::{Distribution, LogNormal};
 use rand_xoshiro::Xoshiro256StarStar;
 
 pub mod args_rets;
+pub mod pool_manager;
 pub mod lossy_convert;
 pub mod queue;
 pub mod shared_rate_resource;
 pub mod status;
 
 use crate::args_rets::*;
+use crate::pool_manager::*;
 use crate::lossy_convert::*;
 use crate::queue::*;
 use crate::shared_rate_resource::*;
 use crate::status::*;
 
-struct AutoscalerWorker {
-    shutting_down: Rc<RefCell<Status>>,
-}
-
-struct AutoscalerSharedRateResource {
-    shutting_down: Rc<RefCell<Status>>,
-    workers: HashMap<u64, AutoscalerWorker>,
-}
-
-struct Autoscaler {
-    name: String,
-    shared_rate_resources: HashMap<u64, AutoscalerSharedRateResource>,
-    //  metrics: ...
-}
 
 struct ScheduledEvent {
     due_time: u64,
