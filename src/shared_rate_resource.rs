@@ -14,6 +14,7 @@ use rand_xoshiro::Xoshiro256StarStar;
 
 use crate::args_rets::*;
 use crate::lossy_convert::*;
+use crate::status::*;
 
 struct SharedRateTenancy {
     due_timer_time: u64,
@@ -46,7 +47,7 @@ pub struct SharedRateResource {
     resource_timer: u64,
     resource_timer_last_updated_real_time: u64,
     wakeup_event_memo: VecDeque<u64>,
-    shutting_down: Rc<RefCell<bool>>,
+    status: Rc<RefCell<Status>>,
     tenancies: BinaryHeap<SharedRateTenancy>,
     rng: Xoshiro256StarStar,
     //  metrics: ...,

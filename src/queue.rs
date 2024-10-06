@@ -14,6 +14,7 @@ use rand_xoshiro::Xoshiro256StarStar;
 
 use crate::args_rets::*;
 use crate::lossy_convert::*;
+use crate::status::*;
 
 pub struct WorkerTokenArgs<Xw> {
     timestamp: u64,
@@ -129,17 +130,8 @@ pub struct Queue<Xw> {
 }
 
 impl<Xw> Queue<Xw> {
-    fn enqueued_handler_inner<Ai, R>(
-        &mut self,
-        inner_handler: impl FnOnce(Ai) -> R + 'static,
-        mut args: Ai,
-    ) -> R
-    where
-        Ai: HasTimestamp + HasWorkerToken<Xw>,
-        R: HasProposedEvents + IntoLossy<Vec<ProposedEvent>> + Default,
-        WorkerTokenArgs<Xw>: IntoLossy<Ai>,
-    {
-        if self.deque.is_empty() && !self.listening_workers.is_empty() {
+    fn pick_worker(&mut self) -> Option<Worker<Xw>> {
+        while !self.listening_workers.is_empty() {
             let chosen_worker_rc = Clone::clone(
                 self.listening_workers
                     .iter()
@@ -156,21 +148,47 @@ impl<Xw> Queue<Xw> {
                     .remove(&chosen_worker_rc);
             }
 
-            args.set_worker_token(Some(WorkerToken {
-                worker: Rc::into_inner(chosen_worker_rc).unwrap(),
-                checkout_timestamp: *args.get_timestamp(),
-                originating_queue_name: self.name.clone(),
-            }));
+            let chosen_worker = Rc::into_inner(chosen_worker_rc).unwrap();
 
-            // TODO tally metric
-
-            return inner_handler(args);
-        } else {
-            self.deque.push_back(Box::new(move |args_outer| {
-                inner_handler(args_outer.into_lossy()).into_lossy()
-            }));
-            return Default::default();
+            if *chosen_worker.status.borrow() != Status::Running {
+                chosen_worker.shutdown();
+            } else {
+                return Some(chosen_worker);
+            }
         }
+
+        None
+    }
+
+    fn enqueued_handler_inner<Ai, R>(
+        &mut self,
+        inner_handler: impl FnOnce(Ai) -> R + 'static,
+        mut args: Ai,
+    ) -> R
+    where
+        Ai: HasTimestamp + HasWorkerToken<Xw>,
+        R: HasProposedEvents + IntoLossy<Vec<ProposedEvent>> + Default,
+        WorkerTokenArgs<Xw>: IntoLossy<Ai>,
+    {
+        if self.deque.is_empty() {
+            if let Some(worker) = self.pick_worker() {
+                args.set_worker_token(Some(WorkerToken {
+                    worker: worker,
+                    checkout_timestamp: *args.get_timestamp(),
+                    originating_queue_name: self.name.clone(),
+                }));
+
+                // TODO tally metric
+
+                return inner_handler(args);
+            }
+        }
+
+        self.deque.push_back(Box::new(move |args_outer| {
+            inner_handler(args_outer.into_lossy()).into_lossy()
+        }));
+
+        Default::default()
     }
 
     pub fn mk_enqueued_handler<Ao, Ai, R>(
@@ -194,8 +212,8 @@ impl<Xw> Queue<Xw> {
 pub struct Worker<Xw> {
     id: u64,
     subscribed_queues: Vec<Rc<RefCell<Queue<Xw>>>>,
-    shutting_down: Rc<RefCell<bool>>,
-    // shared_cpu_resource: Rc<RefCell<SharedRateResource>>,
+    status: Rc<RefCell<Status>>,
+    allow_drop: bool,
     rng: Xoshiro256StarStar,
     ext: Xw,
     //  metrics: ...,
@@ -214,6 +232,21 @@ impl<Xw> PartialEq for Worker<Xw> {
 }
 
 impl<Xw> Eq for Worker<Xw> {}
+
+impl<Xw> Drop for Worker<Xw> {
+    fn drop(&mut self) {
+        if !self.allow_drop {
+            panic!("Worker was dropped without proper shutdown");
+        }
+    }
+}
+
+impl<Xw> Worker<Xw> {
+    pub fn shutdown(mut self) {
+        self.allow_drop = true;
+        // should now drop as method took ownership
+    }
+}
 
 pub struct WorkerToken<Xw> {
     worker: Worker<Xw>,
@@ -244,6 +277,11 @@ impl<Xw> WorkerToken<Xw> {
                     token.checkout_timestamp < timestamp,
                     "Cannot restore WorkerToken until after time period it was checked out",
                 );
+
+                if *token.worker.status.borrow() != Status::Running {
+                    token.worker.shutdown();
+                    continue;
+                }
 
                 let nonempty_queues = Vec::from_iter(
                     token
