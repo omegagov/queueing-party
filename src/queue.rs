@@ -7,6 +7,11 @@ use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
+use prometheus_client::metrics::counter::{Atomic, Counter};
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::Histogram;
+
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, LogNormal};
@@ -14,123 +19,27 @@ use rand_xoshiro::Xoshiro256StarStar;
 
 use crate::args_rets::*;
 use crate::lossy_convert::*;
+use crate::simulation::*;
 use crate::status::*;
 
-pub struct WorkerTokenArgs<Xw> {
-    timestamp: u64,
-    worker_token: Option<WorkerToken<Xw>>,
+pub trait QueueSimulation: Simulation {
+    type WorkerExtension: Default;
+
+    fn get_worker_tokens_checked_out_metric(&self) -> &Family<Vec<(String, String)>, Counter>;
+    fn get_worker_token_duration_metric(&self) -> &Family<Vec<(String, String)>, Histogram>;
+    fn get_up_metric(&self) -> &Family<Vec<(String, String)>, Gauge>;
 }
 
-pub struct WorkerTokenReturn<Xw> {
-    proposed_events: Vec<ProposedEvent>,
-    worker_tokens_to_restore: Vec<WorkerToken<Xw>>,
-}
-
-// avoid derived Default's unnecessary Default bounds on free generic parameter
-impl<Xw> Default for WorkerTokenArgs<Xw> {
-    fn default() -> Self {
-        WorkerTokenArgs {
-            timestamp: Default::default(),
-            worker_token: Default::default(),
-        }
-    }
-}
-
-// avoid derived Default's unnecessary Default bounds on free generic parameter
-impl<Xw> Default for WorkerTokenReturn<Xw> {
-    fn default() -> Self {
-        WorkerTokenReturn {
-            proposed_events: Default::default(),
-            worker_tokens_to_restore: Default::default(),
-        }
-    }
-}
-
-pub trait HasWorkerToken<Xw> {
-    fn get_worker_token(&self) -> &Option<WorkerToken<Xw>>;
-    fn get_worker_token_mut(&mut self) -> &mut Option<WorkerToken<Xw>>;
-    fn set_worker_token(&mut self, new_value: Option<WorkerToken<Xw>>);
-}
-
-pub trait HasWorkerTokensToRestore<Xw> {
-    fn get_worker_tokens_to_restore(&self) -> &Vec<WorkerToken<Xw>>;
-    fn get_worker_tokens_to_restore_mut(&mut self) -> &mut Vec<WorkerToken<Xw>>;
-    fn set_worker_tokens_to_restore(&mut self, new_value: Vec<WorkerToken<Xw>>);
-}
-
-impl<Xw> HasTimestamp for WorkerTokenArgs<Xw> {
-    fn get_timestamp(&self) -> &u64 {
-        &self.timestamp
-    }
-    fn set_timestamp(&mut self, new_value: u64) {
-        self.timestamp = new_value
-    }
-}
-
-impl<Xw> HasWorkerToken<Xw> for WorkerTokenArgs<Xw> {
-    fn get_worker_token(&self) -> &Option<WorkerToken<Xw>> {
-        &self.worker_token
-    }
-    fn get_worker_token_mut(&mut self) -> &mut Option<WorkerToken<Xw>> {
-        &mut self.worker_token
-    }
-    fn set_worker_token(&mut self, new_value: Option<WorkerToken<Xw>>) {
-        self.worker_token = new_value
-    }
-}
-
-impl<Xw> HasProposedEvents for WorkerTokenReturn<Xw> {
-    fn get_proposed_events(&self) -> &Vec<ProposedEvent> {
-        &self.proposed_events
-    }
-    fn get_proposed_events_mut(&mut self) -> &mut Vec<ProposedEvent> {
-        &mut self.proposed_events
-    }
-    fn set_proposed_events(&mut self, new_value: Vec<ProposedEvent>) {
-        self.proposed_events = new_value
-    }
-}
-
-impl<Xw> HasWorkerTokensToRestore<Xw> for WorkerTokenReturn<Xw> {
-    fn get_worker_tokens_to_restore(&self) -> &Vec<WorkerToken<Xw>> {
-        &self.worker_tokens_to_restore
-    }
-    fn get_worker_tokens_to_restore_mut(&mut self) -> &mut Vec<WorkerToken<Xw>> {
-        &mut self.worker_tokens_to_restore
-    }
-    fn set_worker_tokens_to_restore(&mut self, new_value: Vec<WorkerToken<Xw>>) {
-        self.worker_tokens_to_restore = new_value
-    }
-}
-
-impl<Xw> FromLossy<u64> for WorkerTokenArgs<Xw> {
-    fn from_lossy(other: u64) -> WorkerTokenArgs<Xw> {
-        WorkerTokenArgs {
-            timestamp: other,
-            ..Default::default()
-        }
-    }
-}
-
-impl<Xw> FromLossy<Vec<ProposedEvent>> for WorkerTokenReturn<Xw> {
-    fn from_lossy(other: Vec<ProposedEvent>) -> WorkerTokenReturn<Xw> {
-        WorkerTokenReturn {
-            proposed_events: other,
-            ..Default::default()
-        }
-    }
-}
-
-pub struct Queue<Xw> {
+pub struct Queue<S: QueueSimulation + 'static> {
     name: String,
-    listening_workers: HashSet<Rc<Worker<Xw>>>,
-    deque: VecDeque<Box<dyn FnOnce(WorkerTokenArgs<Xw>) -> Vec<ProposedEvent>>>,
+    listening_workers: HashSet<Rc<Worker<S>>>,
+    deque: VecDeque<Box<dyn FnOnce(&'static S, u64, WorkerToken<S>) -> Vec<ProposedEvent<S>>>>,
     rng: Xoshiro256StarStar,
-    //  metrics: ...,
+    metric_labels: Vec<(String, String)>,
 }
 
-impl<Xw> Queue<Xw> {
-    fn pick_worker(&mut self) -> Option<Worker<Xw>> {
+impl<S: QueueSimulation + 'static> Queue<S> {
+    fn pick_worker(&mut self, simulation: &'static S) -> Option<Worker<S>> {
         while !self.listening_workers.is_empty() {
             let chosen_worker_rc = Clone::clone(
                 self.listening_workers
@@ -151,7 +60,7 @@ impl<Xw> Queue<Xw> {
             let chosen_worker = Rc::into_inner(chosen_worker_rc).unwrap();
 
             if *chosen_worker.status.borrow() != Status::Running {
-                chosen_worker.shutdown();
+                chosen_worker.shutdown(simulation);
             } else {
                 return Some(chosen_worker);
             }
@@ -160,80 +69,75 @@ impl<Xw> Queue<Xw> {
         None
     }
 
-    fn enqueued_handler_inner<Ai, R>(
+    fn enqueued_handler_inner(
         &mut self,
-        inner_handler: impl FnOnce(Ai) -> R + 'static,
-        mut args: Ai,
-    ) -> R
-    where
-        Ai: HasTimestamp + HasWorkerToken<Xw>,
-        R: HasProposedEvents + IntoLossy<Vec<ProposedEvent>> + Default,
-        WorkerTokenArgs<Xw>: IntoLossy<Ai>,
-    {
+        inner_handler: impl FnOnce(&'static S, u64, WorkerToken<S>) -> Vec<ProposedEvent<S>> + 'static,
+        simulation: &'static S,
+        timestamp: u64,
+    ) -> Vec<ProposedEvent<S>> {
         if self.deque.is_empty() {
-            if let Some(worker) = self.pick_worker() {
-                args.set_worker_token(Some(WorkerToken {
+            if let Some(worker) = self.pick_worker(simulation) {
+                let mut token = WorkerToken {
+                    metric_labels: worker.metric_labels.clone(),
                     worker: worker,
-                    checkout_timestamp: *args.get_timestamp(),
+                    checkout_timestamp: timestamp,
                     originating_queue_name: self.name.clone(),
-                }));
+                };
+                token
+                    .metric_labels
+                    .push(("originating_queue".to_owned(), self.name.clone()));
 
-                // TODO tally metric
+                simulation
+                    .get_worker_tokens_checked_out_metric()
+                    .get_or_create(&token.metric_labels)
+                    .inc();
 
-                return inner_handler(args);
+                return inner_handler(simulation, timestamp, token);
             }
         }
 
-        self.deque.push_back(Box::new(move |args_outer| {
-            inner_handler(args_outer.into_lossy()).into_lossy()
-        }));
+        self.deque.push_back(Box::new(inner_handler));
 
         Default::default()
     }
 
-    pub fn mk_enqueued_handler<Ao, Ai, R>(
-        queue: Rc<RefCell<Queue<Xw>>>,
-        inner_handler: impl FnOnce(Ai) -> R + 'static,
-    ) -> impl FnOnce(Ao) -> R
-    where
-        Ao: HasTimestamp + IntoLossy<Ai>,
-        Ai: HasTimestamp + HasWorkerToken<Xw>,
-        R: HasProposedEvents + IntoLossy<Vec<ProposedEvent>> + Default,
-        WorkerTokenArgs<Xw>: IntoLossy<Ai>,
-    {
-        move |args_outer: Ao| {
+    pub fn mk_enqueued_handler(
+        queue: Rc<RefCell<Queue<S>>>,
+        inner_handler: impl FnOnce(&'static S, u64, WorkerToken<S>) -> Vec<ProposedEvent<S>> + 'static,
+    ) -> impl FnOnce(&'static S, u64) -> Vec<ProposedEvent<S>> {
+        move |simulation, timestamp| {
             queue
                 .borrow_mut()
-                .enqueued_handler_inner(inner_handler, args_outer.into_lossy())
+                .enqueued_handler_inner(inner_handler, simulation, timestamp)
         }
     }
 }
 
-pub struct Worker<Xw> {
-    id: u64,
-    subscribed_queues: Vec<Rc<RefCell<Queue<Xw>>>>,
-    status: Rc<RefCell<Status>>,
-    allow_drop: bool,
-    rng: Xoshiro256StarStar,
-    ext: Xw,
-    //  metrics: ...,
+pub struct Worker<S: QueueSimulation + 'static> {
+    pub id: u64,
+    pub subscribed_queues: Vec<Rc<RefCell<Queue<S>>>>,
+    pub status: Rc<RefCell<Status>>,
+    pub allow_drop: bool,
+    pub rng: Xoshiro256StarStar,
+    pub metric_labels: Vec<(String, String)>,
+    pub ext: S::WorkerExtension,
 }
 
-impl<Xw> Hash for Worker<Xw> {
+impl<S: QueueSimulation + 'static> Hash for Worker<S> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
 }
 
-impl<Xw> PartialEq for Worker<Xw> {
+impl<S: QueueSimulation + 'static> PartialEq for Worker<S> {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
-impl<Xw> Eq for Worker<Xw> {}
+impl<S: QueueSimulation + 'static> Eq for Worker<S> {}
 
-impl<Xw> Drop for Worker<Xw> {
+impl<S: QueueSimulation + 'static> Drop for Worker<S> {
     fn drop(&mut self) {
         if !self.allow_drop {
             panic!("Worker was dropped without proper shutdown");
@@ -241,99 +145,108 @@ impl<Xw> Drop for Worker<Xw> {
     }
 }
 
-impl<Xw> Worker<Xw> {
-    pub fn shutdown(mut self) {
+impl<S: QueueSimulation + 'static> Worker<S> {
+    pub fn shutdown(mut self, simulation: &'static S) {
+        simulation
+            .get_up_metric()
+            .get_or_create(&self.metric_labels)
+            .set(0);
         self.allow_drop = true;
         // should now drop as method took ownership
     }
+
+    pub fn listen(mut self, simulation: &'static S, timestamp: u64) -> Vec<ProposedEvent<S>> {
+        simulation
+            .get_up_metric()
+            .get_or_create(&self.metric_labels)
+            .set(1);
+
+        if *self.status.borrow() != Status::Running {
+            self.shutdown(simulation);
+            return Default::default();
+        }
+
+        let nonempty_queues = Vec::from_iter(
+            self.subscribed_queues
+                .iter()
+                .filter(|q| !q.borrow().deque.is_empty()),
+        );
+        if nonempty_queues.is_empty() {
+            // return worker to all subscribed queues
+            let worker_rc = Rc::new(self);
+            for queue in &worker_rc.subscribed_queues {
+                queue
+                    .borrow_mut()
+                    .listening_workers
+                    .insert(worker_rc.clone());
+            }
+            return Default::default();
+        }
+
+        // else this worker picks up a new handler from a nonempty queue
+
+        // choose a nonempty queue
+        let chosen_queue = SliceRandom::choose(&nonempty_queues[..], &mut self.rng).unwrap();
+        let chosen_queue_name = chosen_queue.borrow().name.clone();
+        let followon_handler = chosen_queue.borrow_mut().deque.pop_front().unwrap();
+        let mut followon_token = WorkerToken {
+            metric_labels: self.metric_labels.clone(),
+            originating_queue_name: chosen_queue_name.clone(),
+            worker: self,
+            checkout_timestamp: timestamp,
+        };
+        followon_token
+            .metric_labels
+            .push(("originating_queue".to_owned(), chosen_queue_name));
+
+        // tally metric
+        simulation
+            .get_worker_tokens_checked_out_metric()
+            .get_or_create(&followon_token.metric_labels)
+            .inc();
+
+        // call follow-on handler
+        followon_handler(simulation, timestamp, followon_token)
+    }
 }
 
-pub struct WorkerToken<Xw> {
-    worker: Worker<Xw>,
+pub struct WorkerToken<S: QueueSimulation + 'static> {
+    worker: Worker<S>,
     checkout_timestamp: u64,
     originating_queue_name: String,
+    metric_labels: Vec<(String, String)>,
 }
 
-impl<Xw> WorkerToken<Xw> {
-    pub fn mk_token_restoring_handler<A, Ri, Ro>(
-        inner_handler: impl FnOnce(A) -> Ri,
-    ) -> impl FnOnce(A) -> Ro
-    where
-        A: HasTimestamp,
-        Ri: HasProposedEvents + HasWorkerTokensToRestore<Xw> + IntoLossy<Ro>,
-        Ro: HasProposedEvents,
-    {
-        |args: A| {
-            let timestamp = *args.get_timestamp();
+impl<S: QueueSimulation + 'static> WorkerToken<S> {
+    pub fn mk_token_restoring_handler(
+        inner_handler: impl FnOnce(&'static S, u64) -> (Vec<ProposedEvent<S>>, Vec<WorkerToken<S>>),
+    ) -> impl FnOnce(&'static S, u64) -> Vec<ProposedEvent<S>> {
+        |simulation, timestamp| {
             // call inner handler
-            let mut ret = inner_handler(args);
+            let (mut proposed_events, mut tokens_to_restore) = inner_handler(simulation, timestamp);
 
             // proposed events that follow-on handlers may produce
             let mut followon_proposed_events = Vec::new();
 
             // handle restored tokens
-            for mut token in ret.get_worker_tokens_to_restore_mut().drain(..) {
+            for mut token in tokens_to_restore.drain(..) {
                 assert!(
                     token.checkout_timestamp < timestamp,
                     "Cannot restore WorkerToken until after time period it was checked out",
                 );
 
-                if *token.worker.status.borrow() != Status::Running {
-                    token.worker.shutdown();
-                    continue;
-                }
+                simulation
+                    .get_worker_token_duration_metric()
+                    .get_or_create(&token.metric_labels)
+                    .observe((timestamp - token.checkout_timestamp) as f64 / S::TICKS_PER_SECOND);
 
-                let nonempty_queues = Vec::from_iter(
-                    token
-                        .worker
-                        .subscribed_queues
-                        .iter()
-                        .filter(|q| !q.borrow().deque.is_empty()),
-                );
-                if nonempty_queues.is_empty() {
-                    // return worker to all subscribed queues
-                    let worker_rc = Rc::new(token.worker);
-                    for queue in &worker_rc.subscribed_queues {
-                        queue
-                            .borrow_mut()
-                            .listening_workers
-                            .insert(worker_rc.clone());
-                    }
-                } else {
-                    // this worker picks up a new handler from a nonempty queue
-
-                    // choose a nonempty queue
-                    let chosen_queue =
-                        SliceRandom::choose(&nonempty_queues[..], &mut token.worker.rng).unwrap();
-                    let followon_handler = chosen_queue.borrow_mut().deque.pop_front().unwrap();
-                    let chosen_queue_name = chosen_queue.borrow().name.clone();
-
-                    // prepare args
-                    let followon_args = WorkerTokenArgs {
-                        timestamp: timestamp,
-                        worker_token: Some(WorkerToken {
-                            originating_queue_name: chosen_queue_name,
-                            worker: token.worker,
-                            checkout_timestamp: timestamp,
-                        }),
-                        ..Default::default()
-                    };
-
-                    // TODO tally metric
-
-                    // call follow-on handler
-                    let mut followon_ret = followon_handler(followon_args);
-
-                    // gather its proposed events
-                    followon_proposed_events.append(followon_ret.get_proposed_events_mut());
-                }
+                followon_proposed_events.append(&mut token.worker.listen(simulation, timestamp));
             }
 
             // combine proposed events from follow-ons into our ret
-            ret.get_proposed_events_mut()
-                .append(&mut followon_proposed_events);
+            proposed_events.append(&mut followon_proposed_events);
 
-            return ret.into_lossy();
+            return proposed_events;
         }
     }
 }
