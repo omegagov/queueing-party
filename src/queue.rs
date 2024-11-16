@@ -132,12 +132,22 @@ impl<S: QueueSimulation + 'static> Queue<S> {
 
             self.listening_workers.remove(&chosen_worker_rc);
 
-            for other_queue in &chosen_worker_rc.subscribed_queues {
-                other_queue
-                    .borrow_mut()
-                    .listening_workers
-                    .remove(&chosen_worker_rc);
+            let mut found_self = false;
+            for other_queue_rc in &chosen_worker_rc.subscribed_queues {
+                if let Ok(mut other_queue) = other_queue_rc.try_borrow_mut() {
+                    other_queue.listening_workers.remove(&chosen_worker_rc);
+                } else {
+                    // this is presumably a reference to ourselves that we failed to
+                    // borrow because we're already operating within that borrow - but
+                    // it should only happen once in that case
+                    assert!(
+                        !found_self,
+                        "Failed to borrow_mut more than one queue in subscribed_queues"
+                    );
+                    found_self = true;
+                }
             }
+            assert!(found_self);
 
             let chosen_worker = Rc::into_inner(chosen_worker_rc).unwrap();
 
