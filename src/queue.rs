@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::{max, Eq, Ordering, PartialEq};
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
@@ -10,7 +10,8 @@ use std::rc::Rc;
 use prometheus_client::metrics::counter::{Atomic, Counter};
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
+use prometheus_client::registry::Registry;
 
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -30,12 +31,93 @@ pub trait QueueSimulation: Simulation {
     fn get_up_metric(&self) -> &Family<Vec<(String, String)>, Gauge>;
 }
 
+pub struct BaseQueueSimulation {
+    simulation: BaseSimulation,
+
+    worker_tokens_checked_out_metric: Family<Vec<(String, String)>, Counter>,
+    worker_token_duration_metric: Family<Vec<(String, String)>, Histogram>,
+    up_metric: Family<Vec<(String, String)>, Gauge>,
+}
+
+impl BaseQueueSimulation {
+    pub fn new(id: u64, metric_registry: Registry) -> Self {
+        let r = BaseQueueSimulation {
+            simulation: BaseSimulation::new(id, metric_registry),
+
+            worker_tokens_checked_out_metric: Default::default(),
+            worker_token_duration_metric: Family::new_with_constructor(|| {
+                Histogram::new(exponential_buckets(0.01, 2.0, 16))
+            }),
+            up_metric: Default::default(),
+        };
+
+        r.simulation.borrow_metric_registry_mut().register(
+            "worker_tokens_checked_out",
+            "Number of worker tokens checked out",
+            r.worker_tokens_checked_out_metric.clone(),
+        );
+        r.simulation.borrow_metric_registry_mut().register(
+            "worker_token_duration",
+            "Lifetime of worker token from checkout to restoration",
+            r.worker_token_duration_metric.clone(),
+        );
+        r.simulation.borrow_metric_registry_mut().register(
+            "up",
+            "Whether worker is up",
+            r.up_metric.clone(),
+        );
+
+        r
+    }
+}
+
+impl Simulation for BaseQueueSimulation {
+    const TICKS_PER_SECOND: f64 = BaseSimulation::TICKS_PER_SECOND;
+    const METRICS_SAMPLING_PERIOD_SECONDS: f64 = BaseSimulation::METRICS_SAMPLING_PERIOD_SECONDS;
+
+    fn get_id(&self) -> u64 {
+        self.simulation.get_id()
+    }
+
+    fn get_events_dispatched_metric(&self) -> &Counter {
+        self.simulation.get_events_dispatched_metric()
+    }
+
+    fn borrow_metric_registry(&self) -> Ref<'_, Registry> {
+        self.simulation.borrow_metric_registry()
+    }
+
+    fn borrow_metric_registry_mut(&self) -> RefMut<'_, Registry> {
+        self.simulation.borrow_metric_registry_mut()
+    }
+
+    fn borrow_rng_mut(&self) -> RefMut<'_, Xoshiro256StarStar> {
+        self.simulation.borrow_rng_mut()
+    }
+}
+
+impl QueueSimulation for BaseQueueSimulation {
+    type WorkerExtension = ();
+
+    fn get_worker_tokens_checked_out_metric(&self) -> &Family<Vec<(String, String)>, Counter> {
+        &self.worker_tokens_checked_out_metric
+    }
+
+    fn get_worker_token_duration_metric(&self) -> &Family<Vec<(String, String)>, Histogram> {
+        &self.worker_token_duration_metric
+    }
+
+    fn get_up_metric(&self) -> &Family<Vec<(String, String)>, Gauge> {
+        &self.up_metric
+    }
+}
+
 pub struct Queue<S: QueueSimulation + 'static> {
-    name: String,
-    listening_workers: HashSet<Rc<Worker<S>>>,
-    deque: VecDeque<Box<dyn FnOnce(&'static S, u64, WorkerToken<S>) -> Vec<ProposedEvent<S>>>>,
-    rng: Xoshiro256StarStar,
-    metric_labels: Vec<(String, String)>,
+    pub name: String,
+    pub listening_workers: HashSet<Rc<Worker<S>>>,
+    pub deque: VecDeque<Box<dyn FnOnce(&'static S, u64, WorkerToken<S>) -> Vec<ProposedEvent<S>>>>,
+    pub rng: Xoshiro256StarStar,
+    pub metric_labels: Vec<(String, String)>,
 }
 
 impl<S: QueueSimulation + 'static> Queue<S> {

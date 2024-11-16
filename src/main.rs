@@ -26,9 +26,9 @@ use crate::shared_rate_resource::*;
 use crate::simulation::*;
 use crate::status::*;
 
-use std::io::stdout;
 use prometheus_client::encoding::text::encode_registry;
 use prometheus_client::registry::Registry;
+use std::io::stdout;
 
 fn metric_collection_event<S: Simulation + 'static>(
     simulation: &'static S,
@@ -36,10 +36,7 @@ fn metric_collection_event<S: Simulation + 'static>(
 ) -> Vec<ProposedEvent<S>> {
     let mut outstr: String = Default::default();
 
-    encode_registry(
-        &mut outstr,
-        &simulation.borrow_metric_registry(),
-    ).unwrap();
+    encode_registry(&mut outstr, &simulation.borrow_metric_registry()).unwrap();
 
     std::io::Write::write_all(&mut stdout(), outstr.as_bytes()).unwrap();
 
@@ -47,7 +44,8 @@ fn metric_collection_event<S: Simulation + 'static>(
         due_time: LogNormal::from_mean_cv(
             (S::METRICS_SAMPLING_PERIOD_SECONDS * S::TICKS_PER_SECOND) as f32,
             0.0,
-        ).unwrap(),
+        )
+        .unwrap(),
         handler: Box::new(metric_collection_event::<S>),
     }]
 }
@@ -57,10 +55,7 @@ fn bootstrap<S: Simulation + 'static>(
     timestamp: u64,
 ) -> Vec<ProposedEvent<S>> {
     vec![ProposedEvent {
-        due_time: LogNormal::from_mean_cv(
-            1.0,
-            0.0,
-        ).unwrap(),
+        due_time: LogNormal::from_mean_cv(1.0, 0.0).unwrap(),
         handler: Box::new(metric_collection_event::<S>),
     }]
 }
@@ -69,12 +64,13 @@ fn main() {
     let id: u64 = 1234;
     let mut simulation = Box::new(BaseSimulation::new(
         id,
-        Registry::with_labels(vec![
-            (
+        Registry::with_labels(
+            vec![(
                 Cow::from("simulation_id"),
                 Cow::from(&*Box::leak(format!("{id:016x}").into_boxed_str())),
-            )
-        ].into_iter()),
+            )]
+            .into_iter(),
+        ),
     ));
 
     main_loop(Box::leak(simulation), Box::new(bootstrap));
