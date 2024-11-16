@@ -222,7 +222,13 @@ impl<S: QueueSimulation + 'static> Eq for Worker<S> {}
 impl<S: QueueSimulation + 'static> Drop for Worker<S> {
     fn drop(&mut self) {
         if !self.allow_drop {
-            panic!("Worker was dropped without proper shutdown");
+            let msg = format!("Worker {} was dropped without proper shutdown", self.id);
+
+            if std::thread::panicking() {
+                std::eprintln!("{msg} (but already panicking)");
+            } else {
+                panic!("{msg}");
+            }
         }
     }
 }
